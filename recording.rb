@@ -1,5 +1,5 @@
 class Recording < ApplicationRecord
-  
+  self.ignored_columns =['content',"recording_notes"]
   has_one_attached :audio_file
   has_one_attached :raw_transcript, service: :raw_transcripts 
   #has_one_attached :raw_transcript, service: :dev_raw_transcripts 
@@ -14,13 +14,14 @@ class Recording < ApplicationRecord
   
   ###########################.  Transcription.  #####################################################
   # maps the column :transcription_status to these readable names
-  enum :transcription_status, { 
-    not_requested: 0, 
-    pending: 1, 
-    processing: 2, 
-    completed: 3, 
-    failed: 4 ,
-    enqueued: 5
+  enum :transcription_status,{
+    bypassed: 0,  
+    requested: 1, 
+    preparing: 2, # Worker B is currently unzipping/downloading
+    prepared: 3,  # Worker B is DONE; Chunks are ready for Worker A
+    processing: 4,# Worker A is actively transcribing not needed
+    completed: 5, 
+    failed: 6 
   }
   
   #priority. set if transcription required leave null if not required
@@ -48,15 +49,14 @@ class Recording < ApplicationRecord
 
 
 ###############################   callbacks  ######################################
-  before_validation :ensure_strings4text
-  before_validation :sanitize_content
   before_validation :set_number, :if => Proc.new { |r| r.new_record? } 
   
   before_save :sync_searchable_text, if: -> { title_changed? || writeup.changed? }
-  before_save :clear_error_message, if: ->  { transcription_status_changed? and (transcription_status == "failed") }
   before_destroy :verify_destroy 
   
-  before_validation :reset_when_transcript_set_to_not_requested, if: ->  { transcription_status_changed? and (transcription_status == "not_requested") }
+  before_validation :reset_when_transcript_set_to_bypassed, if: ->  { transcription_status_changed? and (transcription_status == "bypassed") }
+  # 2. THE ATTACHMENT SYNC: Ensure status is 'completed' if file exists
+   before_validation :sync_status_with_attachment, if: :new_raw_transcript_attached?
 ###############################   Relationships  ######################################
 
   belongs_to :happening 
@@ -91,11 +91,13 @@ class Recording < ApplicationRecord
   validates_uniqueness_of :title, :scope => :happening_id 
  # validates_uniqueness_of :number, :scope => :happening_id 
   validates_length_of :title,   maximum: 80
-  validate :within_parent_dates, :unless => Proc.new { |r| r.start_datetime.blank? }
+  validate :within_parent_dates, :unless => Proc.new { |r| r.happening_id.blank? || r.start_datetime.blank? }
   validate :validate_unique_resources
-  validates_associated :resources, :message=> "you ho"
-  # Validation: cannot be 'completed' without a file
-  validate :status_cannot_change_if_transcript_attached, on: :update
+  validates_associated :resources, :message=> "you ho" 
+  
+  # 1. THE STATUS GUARD: Prevent changing status once it is 'completed'
+ #   validate :transcription_status_cannot_be_changed_from_completed , on: :update
+    validate :status_must_match_attachment
   ###############################   scope  ######################################
   scope :by_happening,lambda{|happening_id | where(:happening_id =>happening_id)}
   
@@ -125,57 +127,17 @@ class Recording < ApplicationRecord
   end
 
   
-   
-   def self.enqueue_next_transcription
-     # Check for any job in the 'transcribe' queue that hasn't finished yet.
-     # This covers Ready, Claimed, and Scheduled statuses.
-     where(transcription_status: [:processing, :enqueued])
-         .where("updated_at < ?", 1.hours.ago)
-         .update_all(transcription_status: :failed, error_message: "Process timed out.")
-     return if SolidQueue::ReadyExecution.exists?(queue_name: "transcribe") || 
-               SolidQueue::ClaimedExecution.exists?(job_id: SolidQueue::Job.where(queue_name: "transcribe"))
-
-     transaction do
-       # 1. Clean up "Stuck" records (Any state that isn't completed/failed but hit the limit)
-       stuck_recs = where(transcription_status: [:pending, :processing, :enqueued])
-                    .where("transcription_attempts >= 3")
-
-       stuck_recs.each do |rec|
-         # Mark as failed so the Watchdog stops trying to enqueue it
-         rec.update!(
-           transcription_status: :failed, 
-           error_message: "Max attempts (3) reached. The process failed to complete."
-         )
-  
-         # Send the alert
-         logger.debug "[transcription] Max attempts reached for Recording #{rec.id}. Sending alert."
-         FailedTranscriptionMailer.transcription_failed_alert(rec).deliver_later
-        end
-       # Your locking logic is excellent for preventing double-processing
-       next_rec = where(transcription_status: :pending)
-                  .where("transcription_attempts < 3")
-                  .where.not(priority: nil)
-                  .order(priority: :desc, happening_id: :desc, number: :asc)
-                  .lock("FOR UPDATE SKIP LOCKED")
-                  .first
-
-       if next_rec
-         # We mark it as 'enqueued' or similar here if you have a status for it,
-         # to prevent the Watchdog from seeing it as 'pending' in the split second 
-         # before the job actually starts and sets it to 'processing'.
-          next_rec.increment!(:transcription_attempts)
-         next_rec.update!(
-           transcription_status: :enqueued,
-           transcribed_at: Time.current
-         )
-         TranscribeRecordingJob.perform_later(next_rec.id)
-          return true # Explicitly return success
-       else
-         logger.debug "[Queue] No transcribable recordings found or max attempts reached."
-         return false # Explicitly return that no work was found
-       end
-     end
-   end
+  def log_status(message)
+    # Detect the "Cage" based on the environment variable we set in systemd
+    cage = ENV['QUEUES'] == 'transcription_heavy' ? "MUSCLE" : "SYSTEM"
+    
+    # In development on your Mac, you can add more flair
+  #  location = Rails.env.development? ? "MAC" : "SERVER"
+    
+    transcription_logs.create!(
+      message: "[#{cage}] #{message}"
+    )
+  end
 
 
   def length
@@ -185,7 +147,39 @@ class Recording < ApplicationRecord
       length 
   end
     
- 
+  def self.enqueue_next_transcription
+    Rails.logger.debug "\n\nenqueue_next_transcription\n\n"
+    puts"\nenqueue_next_transcription"
+    # 1. THE JANITOR: Clean up ghosts before starting new work
+    self.cleanup_stale_transcriptions
+  
+    # 2. THE DISPATCHER: Rails 8 style transaction
+    transaction do
+      # Fetch next recording with Row Locking to prevent double-processing
+      next_rec = where(transcription_status: :requested) # Your plan said 'requested'
+                 .where.not(priority: nil)
+                 .order(priority: :desc, id: :asc)
+                 .lock("FOR UPDATE SKIP LOCKED")
+                 .first
+      return unless next_rec
+    
+       
+       
+        next_rec.purge_ghost_raw_transcript_blobs
+      
+        job = TranscriptionJob.create!(recording: next_rec, status: :processing)
+
+        # Move status to preparing (Don't set transcribed_at yet!)
+        next_rec.update!(transcription_status: :preparing)
+      
+        # The Handoff to the System Cage (Cores 0-1)
+        TranscriptionPrepJob.perform_later(job.id)
+      
+     
+    end
+  end
+
+
   
  
   
@@ -196,34 +190,120 @@ class Recording < ApplicationRecord
     self.number = no +1
   end
   
-  def remove_transcript!
-    unless raw_transcript.attached?
-      errors.add(:base, "No transcript is attached to this recording")
-      return false
+  def deliberate_clear_transcript!
+    ActiveRecord::Base.transaction do
+      # 1. Lock the recording to prevent User A/B race conditions
+      lock! 
+
+      # 2. Identify the 'official' blob if it exists
+      valid_blob_id = raw_transcript.attached? ? raw_transcript.blob_id : nil
+
+      # 3. THE GHOST HUNTER: Kill matching keys, but ONLY the old ones
+      # This leaves "User B's" 2-minute-old upload alone.
+      ActiveStorage::Blob.where(key: your_custom_key_logic)
+                         .where.not(id: valid_blob_id)
+                         .where("created_at < ?", 1.hour.ago)
+                         .find_each(&:purge)
+
+      # 4. THE OFFICIAL PURGE: If a valid one exists, kill it now
+      raw_transcript.purge if raw_transcript.attached?
+
+      # 5. THE RESET: Update status
+      update!(transcription_status: :bypassed)
     end
-    transaction do
-       raw_transcript.purge_later
-       update(transcription_status: "not_requested", priority: nil,transcription_attempts: 0)
-    end
+  rescue StandardError => e
+    Rails.logger.error "Manual Janitor Failed: #{e.message}"
+    raise e # Re-raise so the UI knows it failed
   end
+  
+
+  
+
+  
+  def remove_raw_transcript
+    success = ActiveRecord::Base.transaction do
+      # 1. Kill the current attachment link and blob
+      raw_transcript.purge if raw_transcript.attached?
+
+      # 2. Reset status
+      update!(transcription_status: :bypassed)
+      true
+    end
+
+    # 3. Clean up orphans outside the lock to keep DB snappy
+    purge_ghost_raw_transcript_blobs if success
+    success
+    rescue StandardError => e
+      Rails.logger.error "Remove Transcript Failed: #{e.message}"
+      false
+  end
+  
+  def purge_ghost_raw_transcript_blobs
+  
+    filename = "#{happening_id}_S#{number}_#{title}".gsub(/[^\w\.\-]/, '_')
+    custom_key = "#{filename}.txt"
+    
+    # 1. Identify the 'official' blob if it exists
+    valid_blob_id = raw_transcript.attached? ? raw_transcript.blob_id : nil
+    
+    # 2. Find ALL blobs using this key (older than 1 hour)
+    ActiveStorage::Blob.where(key: custom_key)
+                       .where("created_at < ?", 1.hour.ago)
+                       .find_each do |blob|
+    
+      # 3. THE PHYSICAL CHECK: If it's not our official one OR the file is physically missing
+      # We purge if:
+      #   - It's a ghost (not the official ID)
+      #   - OR it's the official one but the actual file is gone (broken link)
+      is_official = (blob.id == valid_blob_id)
+      file_exists = blob.service.exist?(blob.key)
+    
+      if !is_official || !file_exists
+        Rails.logger.info "Janitor: Purging #{is_official ? 'Zombie' : 'ghost'} blob #{blob.id}"
+        blob.purge
+      end
+    end
+  
+  
+  end 
+  
   
   # Helper for the view to check physical existence safely
   def raw_transcript_physically_exists?
     raw_transcript.attached? && raw_transcript.blob.service.exist?(raw_transcript.key)
   end
   
-private
+  def custom_key_for_transcript
+    filename ="#{happening_id}_S#{number}_#{title}".gsub(/[^\w\.\-]/, '_').gsub('&', 'and')
+                .gsub(/[^\w\.\-\(\)\&]/, '_')
+      custom_key = "#{filename}.txt"
+  end
+
+  private
+
+  def self.cleanup_stale_transcriptions
+    # Match the timeframe to the message (90 mins is safer for huge files)
+    TranscriptionJob.where(status: :processing)
+                    .where("updated_at < ?", 90.minutes.ago)
+                    .find_each do |job|
+      transaction do
+        job.update!(status: :failed, ended_at: Time.current)
+      
+        job.recording.update!(
+          transcription_status: :failed,
+          error_message: "Stale Job: No activity detected for 90 minutes. Muscle Cage timed out."
+        )
+      
+        job.recording.log_status("System: Stale job detected. Marking as Failed for manual review.")
+      end
+    end
+  end
   
-  def reset_when_transcript_set_to_not_requested
+  def reset_when_transcript_set_to_bypassed
      self.priority = nil
-     self.transcription_attempts =0
   end
  
-  
-  def clear_error_message
-    self.error_message = ""
-    self.transcription_attempts =0
-  end
+ 
 
   def centre_id
     case happening.type
@@ -286,26 +366,31 @@ private
 
       (throw :abort )unless allow_destroy
   end
-  def sanitize_content
-    self.content =sanitize(content, :tags=> %w(h5))
-  #                ActionView::Base.full_sanitizer.sanitize(html_string, :tags => %w(img br p), :attributes => %w(src style))
 
+
+  
+  def status_must_match_attachment
+    if raw_transcript.attached? && !completed?
+      errors.add(:transcription_status, "must be 'completed' because a transcript file is attached.")
+    end
+    
+    if !raw_transcript.attached? && completed?
+      errors.add(:transcription_status, "cannot be 'completed' without an attached transcript file.")
+    end
   end
 
-  def ensure_strings4text
-     (self.content = "")if self.content.blank?
-      (self.recording_notes= "")if self.recording_notes.blank?
+
+  def new_raw_transcript_attached?
+    # Inspects ActiveStorage's internal change tracker for a new file assignment
+    attachment_changes['raw_transcript'].is_a?(ActiveStorage::Attached::Changes::CreateOne)
   end
   
-  def status_cannot_change_if_transcript_attached
-    # 1. If there's no transcript, or it's being deleted right now, allow the change.
-    return unless raw_transcript.attached?
-    return if raw_transcript.attachment.marked_for_destruction?
-
-    # 2. If the user (via the view) tries to change status to anything but 'completed'
-    # while the transcript file still exists, block it.
-    if transcription_status_changed? && transcription_status != 'completed'
-      errors.add(:transcription_status, "is locked while a transcript is attached. Delete the transcript first.")
+  def sync_status_with_attachment
+    logger.debug "\n\nsync_status_with_attachment\n\n"
+    logger.debug "\n\ntranscription_status #{transcription_status}\n\n"
+    # If the Banker finished but the Architect hasn't run yet, this is the safety net
+    if raw_transcript.attached? && !completed?
+      self.transcription_status = :completed
     end
   end
 
