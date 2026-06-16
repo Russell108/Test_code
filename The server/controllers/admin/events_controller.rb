@@ -1,0 +1,113 @@
+class Admin::EventsController <  Admin::SuperHappeningsController
+  before_action :authenticate_user! 
+ # before_action :load_and_authorize
+  
+
+	def index
+    @search_title= 'Event Search'
+    authorize [:admin, Event]
+    @search_title= 'Event Search'
+    @resource_search_url= admin_events_url()
+    @resource_search.happening_policy_scope = policy_scope([:admin, Event])
+    super
+	end
+  
+	def show
+		#for pdf format find 
+    @happening= Event.find(params[:id])
+    authorize [:admin, @happening]
+    super
+	end
+  
+  
+	def new
+    @happening= current_user.centre.events.new
+   # @happening.happenable = current_user.centre
+     authorize [:admin,  Event]
+    
+    
+    super
+  end
+  
+	def create
+    @happening= current_user.centre.events.new(create_params)
+    authorize [:admin, Event]
+    super
+	end
+  
+ 	def edit
+        @happening = Event.find(params[:id])
+#    @happening= policy_scope([:admin, Event]).find(params[:id])
+    authorize [:admin, @happening]
+     
+    super
+	end
+
+	def update
+   
+     @happening = Event.find(params[:id])
+    authorize [:admin, @happening]
+    super
+	end
+  
+	def destroy
+    @happening= policy_scope([:admin, Event]).find(params[:id])
+    authorize [:admin, @happening]
+	  
+    super
+	end
+  ###############################  private methods  #################################
+  private
+  
+  def create_params
+  	return unless params[:happening]
+  	(params[:happening][:default_resource_format_ids] = params[:happening][:default_resource_format_ids].delete_if(&:blank?))if (params[:happening].has_key? ":default_resource_format_ids") 
+    (params[:happening][:default_print_format_ids] = params[:happening][:default_print_format_ids].delete_if(&:blank?))if (params[:happening].has_key? ":default_print_format_ids")
+  	(params[:happening][:package_format_ids] = params[:happening][:package_format_ids].delete_if(&:blank?))if (params[:happening].has_key? ":package_format_ids") 
+    
+  		safe_attributes =[
+        :title,
+         :body,
+        :protected,
+        :venue_id,
+        :start_date,
+        :end_date,
+        :talk_type_id,
+        :sales_scope_id,
+        :protected,
+        {default_resource_format_ids:[]},
+        {default_print_format_ids:[]},
+        {package_format_ids:[]}]
+  	params.require(:happening).permit(*safe_attributes) 
+  end
+  
+  # other update params in super_happenings controller
+  
+  def update_params
+  	return unless params[:happening]
+  	(params[:happening][:default_resource_format_ids] = params[:happening][:default_resource_format_ids].delete_if(&:blank?))if (params[:happening].has_key? ":default_resource_format_ids") 
+    (params[:happening][:default_print_format_ids] = params[:happening][:default_print_format_ids].delete_if(&:blank?))if (params[:happening].has_key? ":default_print_format_ids")
+  	(params[:happening][:package_format_ids] = params[:happening][:package_format_ids].delete_if(&:blank?))if (params[:happening].has_key? ":package_format_ids") 
+    
+  		safe_attributes =[
+        :title,
+        :body,
+        :protected,
+        :venue_id,
+        :group_id,
+        :start_date,
+        :end_date,
+        :talk_type_id,
+        :sales_scope_id,
+        :stream_id,
+        :protected,
+        {default_resource_format_ids:[]},
+        {default_print_format_ids:[]},
+        {package_format_ids:[]},
+        :document]
+  	params.require(:happening).permit(*safe_attributes) 
+  end
+  
+
+
+end

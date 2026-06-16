@@ -1,0 +1,5 @@
+class DefaultPackage < DefaultItem
+  
+
+
+end

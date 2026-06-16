@@ -1,0 +1,4 @@
+class DefaultResource< DefaultItem
+
+
+end

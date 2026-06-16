@@ -1,0 +1,4 @@
+class MbrType < ApplicationRecord
+  
+  
+end

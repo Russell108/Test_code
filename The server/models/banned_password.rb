@@ -1,0 +1,2 @@
+class BannedPassword < ApplicationRecord
+end
